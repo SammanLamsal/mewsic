@@ -10,7 +10,10 @@
   libGL,
   vulkan-loader,
   fontconfig,
-  xorg,
+  libx11,
+  libxcursor,
+  libxi,
+  libxrandr,
   rsgain,
 }:
 
@@ -22,10 +25,10 @@ let
     libGL
     vulkan-loader
     fontconfig
-    xorg.libX11
-    xorg.libXcursor
-    xorg.libXi
-    xorg.libXrandr
+    libx11
+    libxcursor
+    libxi
+    libxrandr
   ];
 in
 rustPlatform.buildRustPackage {

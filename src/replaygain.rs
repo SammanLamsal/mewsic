@@ -1,7 +1,10 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use eframe::egui;
@@ -26,7 +29,7 @@ pub struct ScanResult {
 }
 
 enum ScanEvent {
-    Started(usize),
+    GroupFinished,
     Finished(ScanResult),
 }
 
@@ -66,15 +69,22 @@ fn is_stream(uri: &str) -> bool {
     uri.contains("://")
 }
 
-/// A ReplayGain scan running on its own thread, since rsgain decodes every file.
+/// A ReplayGain scan running on its own threads, since rsgain decodes every file.
 pub struct ReplayGainScan {
     events: mpsc::Receiver<ScanEvent>,
-    current_group: usize,
+    finished_groups: usize,
     group_count: usize,
 }
 
 impl ReplayGainScan {
-    pub fn start(groups: Vec<ScanGroup>, music_dir: PathBuf, ctx: egui::Context) -> ReplayGainScan {
+    pub fn start(
+        mut groups: Vec<ScanGroup>,
+        music_dir: PathBuf,
+        ctx: egui::Context,
+    ) -> ReplayGainScan {
+        // A big album that starts last would leave the scan finishing on a single core.
+        groups.sort_by_key(|group| Reverse(group.uris.len()));
+
         let group_count = groups.len();
         let (sender, receiver) = mpsc::channel();
         let report = move |event: ScanEvent| {
@@ -89,7 +99,7 @@ impl ReplayGainScan {
 
         ReplayGainScan {
             events: receiver,
-            current_group: 0,
+            finished_groups: 0,
             group_count,
         }
     }
@@ -98,44 +108,55 @@ impl ReplayGainScan {
     pub fn poll(&mut self) -> Option<ScanResult> {
         for event in self.events.try_iter() {
             match event {
-                ScanEvent::Started(index) => self.current_group = index,
+                ScanEvent::GroupFinished => self.finished_groups += 1,
                 ScanEvent::Finished(result) => return Some(result),
             }
         }
         None
     }
 
-    /// A one-based position, for showing "3 of 12".
+    /// Finished and total groups, for showing "3 of 12".
     pub fn progress(&self) -> (usize, usize) {
-        (self.current_group + 1, self.group_count)
+        (self.finished_groups, self.group_count)
     }
 }
 
-fn scan(groups: &[ScanGroup], music_dir: &Path, report: impl Fn(ScanEvent)) {
-    let mut directories = BTreeSet::new();
+/// rsgain only uses one core per run, so groups are scanned by one rsgain run per core.
+fn scan(groups: &[ScanGroup], music_dir: &Path, report: impl Fn(ScanEvent) + Sync) {
+    if let Err(message) = check_rsgain_installed() {
+        report(ScanEvent::Finished(ScanResult {
+            directories: Vec::new(),
+            errors: vec![message],
+        }));
+        return;
+    }
+
+    let next_group = AtomicUsize::new(0);
+    let mut outcomes = Vec::new();
     let mut errors = Vec::new();
 
-    for (index, group) in groups.iter().enumerate() {
-        report(ScanEvent::Started(index));
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..worker_count(groups.len()) {
+            workers.push(scope.spawn(|| scan_worker(groups, music_dir, &next_group, &report)));
+        }
+        for worker in workers {
+            match worker.join() {
+                Ok(worker_outcomes) => outcomes.extend(worker_outcomes),
+                Err(_) => errors.push("a ReplayGain worker stopped unexpectedly".to_string()),
+            }
+        }
+    });
 
-        let output = match run_rsgain(group, music_dir) {
-            Ok(output) => output,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                errors.push(RSGAIN_MISSING.to_string());
-                break;
+    let mut directories = BTreeSet::new();
+    for (group, outcome) in outcomes {
+        match outcome {
+            Ok(()) => {
+                for uri in &group.uris {
+                    directories.insert(parent_directory(uri).to_string());
+                }
             }
-            Err(error) => {
-                errors.push(format!("cannot run rsgain: {error}"));
-                break;
-            }
-        };
-
-        if output.status.success() {
-            for uri in &group.uris {
-                directories.insert(parent_directory(uri).to_string());
-            }
-        } else {
-            errors.push(describe_failure(group, &output));
+            Err(message) => errors.push(message),
         }
     }
 
@@ -143,6 +164,52 @@ fn scan(groups: &[ScanGroup], music_dir: &Path, report: impl Fn(ScanEvent)) {
         directories: directories.into_iter().collect(),
         errors,
     }));
+}
+
+fn check_rsgain_installed() -> Result<(), String> {
+    match std::process::Command::new("rsgain")
+        .arg("--version")
+        .output()
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(RSGAIN_MISSING.to_string()),
+        Err(error) => Err(format!("cannot run rsgain: {error}")),
+    }
+}
+
+fn worker_count(group_count: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    cores.min(group_count)
+}
+
+/// Takes groups off the shared list until none are left.
+fn scan_worker<'a>(
+    groups: &'a [ScanGroup],
+    music_dir: &Path,
+    next_group: &AtomicUsize,
+    report: &impl Fn(ScanEvent),
+) -> Vec<(&'a ScanGroup, Result<(), String>)> {
+    let mut outcomes = Vec::new();
+    loop {
+        let index = next_group.fetch_add(1, Ordering::Relaxed);
+        let Some(group) = groups.get(index) else {
+            return outcomes;
+        };
+        outcomes.push((group, scan_group(group, music_dir)));
+        report(ScanEvent::GroupFinished);
+    }
+}
+
+fn scan_group(group: &ScanGroup, music_dir: &Path) -> Result<(), String> {
+    let output = match run_rsgain(group, music_dir) {
+        Ok(output) => output,
+        Err(error) => return Err(format!("cannot run rsgain: {error}")),
+    };
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(describe_failure(group, &output))
+    }
 }
 
 /// `custom` mode with `--tagmode=i` writes the tags; without `--album` only track gain is written.

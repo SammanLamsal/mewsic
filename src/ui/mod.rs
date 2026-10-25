@@ -47,7 +47,7 @@ mod tests {
             let font_id = egui::FontId::proportional(14.0);
             let has_icons = ui
                 .ctx()
-                .fonts_mut(|fonts| fonts.has_glyphs(&font_id, "⏮⏸⏭▶⏶⏷🔀🔁🔂🔊🗑♪×…·—⚙"));
+                .fonts_mut(|fonts| fonts.has_glyphs(&font_id, "⏮⏸⏭▶⏶⏷🔀🔁🔂🔊🗑♪×…·—⚙⟳"));
             assert!(has_icons);
         });
         output.textures_delta.clear();

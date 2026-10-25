@@ -623,21 +623,35 @@ impl App {
         Some(self.library.song_or_placeholder(uri).into_owned())
     }
 
-    fn show_status_bar(&mut self, ui: &mut egui::Ui) {
+    fn show_status_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             match &self.connection {
-                ConnectionState::Connecting => ui.weak("Connecting to MPD…"),
-                ConnectionState::Connected => {
-                    ui.weak(format!("{} songs in library", self.library.len()))
+                ConnectionState::Connecting => {
+                    ui.weak("Connecting to MPD…");
                 }
-                ConnectionState::Disconnected(reason) => ui.weak(format!("Disconnected: {reason}")),
-            };
+                ConnectionState::Connected => {
+                    ui.weak(format!("{} songs in library", self.library.len()));
+                    if self.status.updating_database {
+                        ui.spinner();
+                        ui.weak("Rescanning…");
+                    } else if ui
+                        .small_button("⟳")
+                        .on_hover_text("Rescan library")
+                        .clicked()
+                    {
+                        actions.push(Action::Mpd(Command::UpdateDatabase(vec![String::new()])));
+                    }
+                }
+                ConnectionState::Disconnected(reason) => {
+                    ui.weak(format!("Disconnected: {reason}"));
+                }
+            }
 
             if let Some(scan) = &self.replay_gain_scan {
-                let (current, total) = scan.progress();
+                let (finished, total) = scan.progress();
                 ui.separator();
                 ui.spinner();
-                ui.weak(format!("ReplayGain: scanning {current} of {total}…"));
+                ui.weak(format!("ReplayGain: {finished} of {total} scanned…"));
             }
 
             if let Some(error) = &self.error {
@@ -834,7 +848,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
-        egui::Panel::bottom("status_bar").show(ui, |ui| self.show_status_bar(ui));
+        egui::Panel::bottom("status_bar").show(ui, |ui| self.show_status_bar(ui, &mut actions));
 
         let panel_margin = egui::Frame::side_top_panel(ui.style())
             .total_margin()

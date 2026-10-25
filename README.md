@@ -28,8 +28,16 @@ Nix users can run `devenv shell` first to get the toolchain, rsgain, and the gra
 `package.nix` builds mewsic with its runtime libraries and rsgain wrapped in, and installs a desktop entry so it shows up in application launchers. The entry also adds Play / Pause, Next and Previous to the right-click menu of mewsic's icon in docks and bars:
 
 ```sh
-nix profile install --impure --expr 'with import <nixpkgs> {}; callPackage ./package.nix {}'
+nix profile install git+file:///path/to/mewsic
 ```
+
+After changing the source, rebuild and replace the installed copy with:
+
+```sh
+nix profile upgrade mewsic
+```
+
+The flake only sees files tracked by git, so `git add` new files before upgrading.
 
 On NixOS you can add `(pkgs.callPackage /path/to/mewsic/package.nix {})` to `environment.systemPackages` instead.
 

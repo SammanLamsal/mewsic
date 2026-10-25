@@ -166,6 +166,7 @@ pub struct PlayerStatus {
     pub position: Option<usize>,
     pub random: bool,
     pub loop_mode: LoopMode,
+    pub updating_database: bool,
 }
 
 impl Default for PlayerStatus {
@@ -178,6 +179,7 @@ impl Default for PlayerStatus {
             position: None,
             random: false,
             loop_mode: LoopMode::Off,
+            updating_database: false,
         }
     }
 }
@@ -450,7 +452,9 @@ impl Worker {
                 self.send_queue(client).await?;
                 self.send_status(client).await
             }
-            Subsystem::Player | Subsystem::Mixer => self.send_status(client).await,
+            Subsystem::Player | Subsystem::Mixer | Subsystem::Update => {
+                self.send_status(client).await
+            }
             Subsystem::Options => {
                 self.send_status(client).await?;
                 self.send_replay_gain(client).await
@@ -583,6 +587,7 @@ impl Worker {
             position: status.current_song.map(|(position, _id)| position.0),
             random: status.random,
             loop_mode: LoopMode::from_mpd(status.repeat, status.single),
+            updating_database: status.update_job.is_some(),
         };
         self.events.send(Event::Status {
             status,
