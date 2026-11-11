@@ -3,10 +3,3 @@
 .devenv.flake.nix
 .direnv/
 devenv.local.nix
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target

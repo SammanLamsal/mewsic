@@ -50,16 +50,16 @@ pub fn show(
 fn show_mode_buttons(ui: &mut egui::Ui, status: &PlayerStatus, actions: &mut Vec<Action>) {
     if ui
         .selectable_label(status.random, "🔀")
-        .on_hover_text("Shuffle (random order)")
+        .on_hover_text("Shuffle (random order) (s)")
         .clicked()
     {
         actions.push(Action::Mpd(Command::SetRandom(!status.random)));
     }
 
     let (label, tooltip) = match status.loop_mode {
-        LoopMode::Off => ("🔁", "Loop: off"),
-        LoopMode::Queue => ("🔁", "Loop: queue"),
-        LoopMode::Track => ("🔂", "Loop: track"),
+        LoopMode::Off => ("🔁", "Loop: off (r)"),
+        LoopMode::Queue => ("🔁", "Loop: queue (r)"),
+        LoopMode::Track => ("🔂", "Loop: track (r)"),
     };
     if ui
         .selectable_label(status.loop_mode != LoopMode::Off, label)
@@ -71,7 +71,7 @@ fn show_mode_buttons(ui: &mut egui::Ui, status: &PlayerStatus, actions: &mut Vec
 }
 
 fn show_playback_buttons(ui: &mut egui::Ui, status: &PlayerStatus, actions: &mut Vec<Action>) {
-    if ui.button("⏮").on_hover_text("Previous").clicked() {
+    if ui.button("⏮").on_hover_text("Previous (Ctrl+H)").clicked() {
         actions.push(Action::Mpd(Command::Previous));
     }
 
@@ -88,7 +88,7 @@ fn show_playback_buttons(ui: &mut egui::Ui, status: &PlayerStatus, actions: &mut
         actions.push(Action::TogglePlayback);
     }
 
-    if ui.button("⏭").on_hover_text("Next").clicked() {
+    if ui.button("⏭").on_hover_text("Next (Ctrl+L)").clicked() {
         actions.push(Action::Mpd(Command::Next));
     }
 }
@@ -142,11 +142,9 @@ fn show_replay_gain(ui: &mut egui::Ui, current: ReplayGainMode, actions: &mut Ve
         .selected_text(replay_gain_label(current))
         .show_ui(ui, |ui| {
             for mode in REPLAY_GAIN_MODES {
-                let selected = mode == current;
                 if ui
-                    .selectable_label(selected, replay_gain_label(mode))
+                    .selectable_label(mode == current, replay_gain_label(mode))
                     .clicked()
-                    && !selected
                 {
                     actions.push(Action::Mpd(Command::SetReplayGain(mode)));
                 }

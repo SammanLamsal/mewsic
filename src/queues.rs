@@ -9,7 +9,7 @@ use crate::mpd::{Command, PlayerStatus};
 
 pub const UNSAVED_QUEUE_NAME: &str = "MPD queue (unsaved)";
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Queue {
     pub name: String,
     pub tracks: Vec<String>,

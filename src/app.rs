@@ -11,24 +11,54 @@ use crate::mpd::{
     Command, ConnectionConfig, Event, MpdHandle, PlayState, PlayerStatus, ReplayGainMode,
 };
 use crate::queues::{self, OpenQueues, QueueStore, Session};
-use crate::replaygain::{self, ReplayGainScan};
+use crate::replaygain::{self, ReplayGainScan, ScanMode};
 use crate::settings::{Settings, SettingsStore};
-use crate::ui::browser::{self, BrowseMode, BrowserSearch, BrowserView};
+use crate::ui::browser::{self, BrowseMode, BrowserCommand, BrowserSearch, BrowserView};
 use crate::ui::dialogs::{self, Dialog, DialogOutcome};
-use crate::ui::tracks::{self, ColumnWidths, Selection, TrackRow, TrackSource, TrackTable};
+use crate::ui::keys::{self, KeyCommand, KeyState};
+use crate::ui::tracks::{
+    self, ColumnWidths, Selection, TrackCommand, TrackRow, TrackSource, TrackTable,
+};
 use crate::ui::transport::{self, TransportState, TransportView};
-use crate::ui::{nowplaying, settings, tabs};
+use crate::ui::{nowplaying, outline_focused_pane, pressed_inside, settings, tabs};
 
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
+const SEEK_STEP: Duration = Duration::from_secs(5);
+const VOLUME_STEP: u8 = 5;
 const EXIT_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const FILTER_ID: &str = "track_filter";
 const MIN_PANEL_WIDTH: f32 = 160.0;
+const RESIZE_STEP: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum View {
     Library,
     Queue(usize),
     Settings,
+}
+
+/// The part of the window that keyboard commands go to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pane {
+    Browser,
+    Tracks,
+    NowPlaying,
+}
+
+impl Pane {
+    pub fn left(self) -> Pane {
+        match self {
+            Pane::Browser | Pane::Tracks => Pane::Browser,
+            Pane::NowPlaying => Pane::Tracks,
+        }
+    }
+
+    pub fn right(self) -> Pane {
+        match self {
+            Pane::Browser => Pane::Tracks,
+            Pane::Tracks | Pane::NowPlaying => Pane::NowPlaying,
+        }
+    }
 }
 
 pub enum ConnectionState {
@@ -44,12 +74,6 @@ pub enum Action {
     ShowView(View),
     SetBrowseMode(BrowseMode),
     SelectCollection(Collection),
-    PlayCollection(Collection),
-    AddCollectionToQueue {
-        tab: usize,
-        collection: Collection,
-    },
-    AskNewQueueFromCollection(Collection),
     SortBy(SortColumn),
     PlayNow(Vec<String>),
     AddToQueue {
@@ -78,8 +102,11 @@ pub enum Action {
     AskRenameTab(usize),
     OpenSavedQueue(String),
     AskDeleteSavedQueue(String),
-    ScanReplayGain(Vec<String>),
-    ScanCollectionReplayGain(Collection),
+    ShowPlaying,
+    ScanReplayGain {
+        uris: Vec<String>,
+        mode: ScanMode,
+    },
     SaveSettings(Settings),
     Quit,
 }
@@ -107,12 +134,21 @@ pub struct App {
     collection: Collection,
     browser_search: BrowserSearch,
     browser_width: Option<f32>,
+    /// Last frame's outer panel widths, which Alt+H/L resize from.
+    browser_panel_width: f32,
+    now_playing_panel_width: f32,
+    /// Set for one frame by Alt+H/L: the pane to resize and how much wider to make it.
+    pane_resize: Option<(Pane, f32)>,
     column_widths: ColumnWidths,
     library_sort: Option<SongSort>,
     filter: String,
     focus_filter: bool,
-    /// Set for one frame by Ctrl+A. The track views apply it, since they know which rows the filter leaves visible.
-    select_all_tracks: bool,
+    focus: Pane,
+    keys: KeyState,
+    /// Set for one frame by a key. The track table applies it, since it knows which rows are visible.
+    track_command: Option<TrackCommand>,
+    /// Like `track_command`, for the sidebar.
+    browser_command: Option<BrowserCommand>,
     selection: Selection,
     transport: TransportState,
     dialog: Option<Dialog>,
@@ -166,11 +202,17 @@ impl App {
             collection: Collection::All,
             browser_search: BrowserSearch::default(),
             browser_width: None,
+            browser_panel_width: 0.0,
+            now_playing_panel_width: 0.0,
+            pane_resize: None,
             column_widths: ColumnWidths::default(),
             library_sort: None,
             filter: String::new(),
             focus_filter: false,
-            select_all_tracks: false,
+            focus: Pane::Tracks,
+            keys: KeyState::default(),
+            track_command: None,
+            browser_command: None,
             selection: Selection::default(),
             transport: TransportState::default(),
             dialog: None,
@@ -225,27 +267,122 @@ impl App {
     fn handle_keyboard(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let text_field_focused = ctx.memory(|memory| memory.focused().is_some());
 
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-            self.focus_filter = true;
-        }
-        if text_field_focused || self.dialog.is_some() {
-            return;
+        let mut commands = Vec::new();
+        commands.extend(ctx.input_mut(keys::read_global));
+        if !text_field_focused && self.dialog.is_none() {
+            commands.extend(ctx.input_mut(|input| keys::read(input, &mut self.keys, self.focus)));
         }
 
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
-            actions.push(Action::TogglePlayback);
+        for command in commands {
+            self.run_key_command(command, actions);
         }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-            && let View::Queue(tab) = self.view
-        {
-            actions.push(Action::RemoveFromTab {
-                tab,
-                positions: self.selection.positions(),
-            });
+    }
+
+    /// Runs before the panels are drawn, so focus and track commands apply in the same frame.
+    fn run_key_command(&mut self, command: KeyCommand, actions: &mut Vec<Action>) {
+        match command {
+            KeyCommand::FocusFilter => {
+                self.focus_filter = true;
+                self.focus = Pane::Tracks;
+            }
+            KeyCommand::FocusBrowserSearch => self.browser_search.focus = true,
+            KeyCommand::FocusLeftPane => self.focus = self.focus.left(),
+            KeyCommand::FocusRightPane => self.focus = self.focus.right(),
+            KeyCommand::ResizeLeft => self.resize_focused_pane(false),
+            KeyCommand::ResizeRight => self.resize_focused_pane(true),
+            KeyCommand::TogglePlayback => actions.push(Action::TogglePlayback),
+            KeyCommand::PreviousTrack => actions.push(Action::Mpd(Command::Previous)),
+            KeyCommand::NextTrack => actions.push(Action::Mpd(Command::Next)),
+            KeyCommand::SeekBackward => self.seek(Command::SeekBackward(SEEK_STEP), actions),
+            KeyCommand::SeekForward => self.seek(Command::SeekForward(SEEK_STEP), actions),
+            KeyCommand::VolumeDown => {
+                let volume = self.status.volume.saturating_sub(VOLUME_STEP);
+                actions.push(Action::Mpd(Command::SetVolume(volume)));
+            }
+            KeyCommand::VolumeUp => {
+                let volume = self.status.volume.saturating_add(VOLUME_STEP).min(100);
+                actions.push(Action::Mpd(Command::SetVolume(volume)));
+            }
+            KeyCommand::ToggleShuffle => {
+                actions.push(Action::Mpd(Command::SetRandom(!self.status.random)));
+            }
+            KeyCommand::CycleLoop => {
+                actions.push(Action::Mpd(Command::SetLoop(self.status.loop_mode.next())));
+            }
+            KeyCommand::ClearSelection => self.selection.clear(),
+            KeyCommand::RemoveSelected => {
+                if let View::Queue(tab) = self.view {
+                    actions.push(Action::RemoveFromTab {
+                        tab,
+                        positions: self.selection.positions(),
+                    });
+                }
+            }
+            KeyCommand::NextTab => actions.push(Action::ShowView(self.neighbouring_tab(true))),
+            KeyCommand::PreviousTab => actions.push(Action::ShowView(self.neighbouring_tab(false))),
+            KeyCommand::NextBrowseMode => self.set_browse_mode(self.browse_mode.next()),
+            KeyCommand::PreviousBrowseMode => self.set_browse_mode(self.browse_mode.previous()),
+            KeyCommand::ShowPlaying => actions.push(Action::ShowPlaying),
+            KeyCommand::Track(command) => self.track_command = Some(command),
+            KeyCommand::Browser(command) => self.browser_command = Some(command),
         }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
-            self.select_all_tracks = true;
+    }
+
+    /// Moves the focused side pane's inner edge one step left or right.
+    fn resize_focused_pane(&mut self, toward_right: bool) {
+        let step = if toward_right {
+            RESIZE_STEP
+        } else {
+            -RESIZE_STEP
+        };
+        self.pane_resize = match self.focus {
+            Pane::Browser => Some((Pane::Browser, step)),
+            Pane::NowPlaying => Some((Pane::NowPlaying, -step)),
+            Pane::Tracks => None,
+        };
+    }
+
+    /// The width Alt+H/L asked `pane`'s panel to take this frame, if any.
+    fn requested_width(&self, pane: Pane, current_width: f32, range: egui::Rangef) -> Option<f32> {
+        let (resized_pane, extra_width) = self.pane_resize?;
+        if resized_pane != pane {
+            return None;
         }
+        Some(range.clamp(current_width + extra_width))
+    }
+
+    fn set_browse_mode(&mut self, mode: BrowseMode) {
+        if self.browse_mode != mode {
+            self.browse_mode = mode;
+            self.browser_search.text.clear();
+            self.browser_width = None;
+        }
+    }
+
+    /// MPD reports an error when seeking while stopped.
+    fn seek(&self, command: Command, actions: &mut Vec<Action>) {
+        if self.status.state != PlayState::Stopped {
+            actions.push(Action::Mpd(command));
+        }
+    }
+
+    /// Tabs run from Library through the queues and wrap around; Settings is skipped.
+    fn neighbouring_tab(&self, forward: bool) -> View {
+        let mut views = vec![View::Library];
+        for tab in 0..self.queues.tabs().len() {
+            views.push(View::Queue(tab));
+        }
+
+        let current = views
+            .iter()
+            .position(|&view| view == self.view)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % views.len()
+        } else {
+            (current + views.len() - 1) % views.len()
+        };
+        views[next]
     }
 
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
@@ -262,11 +399,7 @@ impl App {
             }
             Action::ShowView(view) => self.show_view(view),
             Action::SetBrowseMode(mode) => {
-                if self.browse_mode != mode {
-                    self.browse_mode = mode;
-                    self.browser_search.text.clear();
-                    self.browser_width = None;
-                }
+                self.set_browse_mode(mode);
                 self.browser_search.focus = true;
             }
             Action::SelectCollection(collection) => {
@@ -275,20 +408,6 @@ impl App {
                 }
                 self.collection = collection;
                 self.show_view(View::Library);
-            }
-            Action::PlayCollection(collection) => {
-                let uris = self.library.uris_in(&collection);
-                self.play_now(uris);
-            }
-            Action::AddCollectionToQueue { tab, collection } => {
-                let uris = self.library.uris_in(&collection);
-                let commands = self.queues.append(tab, uris);
-                self.send_all(commands);
-            }
-            Action::AskNewQueueFromCollection(collection) => {
-                let name = self.unique_queue_name(collection.queue_name());
-                let tracks = self.library.uris_in(&collection);
-                self.dialog = Some(Dialog::NewQueue { name, tracks });
             }
             Action::SortBy(column) => self.sort_by(column),
             Action::PlayNow(uris) => self.play_now(uris),
@@ -319,11 +438,8 @@ impl App {
             }
             Action::OpenSavedQueue(name) => self.open_saved_queue(&name),
             Action::AskDeleteSavedQueue(name) => self.dialog = Some(Dialog::ConfirmDelete { name }),
-            Action::ScanReplayGain(uris) => self.scan_replay_gain(ctx, uris),
-            Action::ScanCollectionReplayGain(collection) => {
-                let uris = self.library.uris_in(&collection);
-                self.scan_replay_gain(ctx, uris);
-            }
+            Action::ShowPlaying => self.show_playing(),
+            Action::ScanReplayGain { uris, mode } => self.scan_replay_gain(ctx, uris, mode),
             Action::SaveSettings(settings) => self.save_settings(settings),
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -343,6 +459,21 @@ impl App {
             }
         }
         self.view = view;
+    }
+
+    /// Actions apply after the table is drawn, so the table selects the row next frame.
+    fn show_playing(&mut self) {
+        let Some(tab) = self.queues.active() else {
+            return;
+        };
+        if let Some(song) = self.now_playing()
+            && !Query::parse(&self.filter).matches(&song)
+        {
+            self.filter.clear();
+        }
+        self.show_view(View::Queue(tab));
+        self.focus = Pane::Tracks;
+        self.track_command = Some(TrackCommand::SelectPlaying);
     }
 
     fn sort_by(&mut self, column: SortColumn) {
@@ -506,7 +637,7 @@ impl App {
         self.settings = settings;
     }
 
-    fn scan_replay_gain(&mut self, ctx: &egui::Context, uris: Vec<String>) {
+    fn scan_replay_gain(&mut self, ctx: &egui::Context, uris: Vec<String>, mode: ScanMode) {
         if self.replay_gain_scan.is_some() {
             self.error = Some("A ReplayGain scan is already running".to_string());
             return;
@@ -522,6 +653,7 @@ impl App {
                 self.dialog = Some(Dialog::MusicFolder {
                     path,
                     pending_scan: uris,
+                    scan_mode: mode,
                 });
                 return;
             }
@@ -533,7 +665,7 @@ impl App {
                 songs.push(song);
             }
         }
-        let groups = replaygain::group_by_album(&songs);
+        let groups = replaygain::group(&songs, mode);
         if groups.is_empty() {
             return;
         }
@@ -550,9 +682,7 @@ impl App {
         };
         self.replay_gain_scan = None;
 
-        if !result.directories.is_empty() {
-            self.mpd.send(Command::UpdateDatabase(result.directories));
-        }
+        self.mpd.send(Command::UpdateDatabase(result.directories));
         let error_count = result.errors.len();
         if let Some(first_error) = result.errors.into_iter().next() {
             self.error = Some(if error_count > 1 {
@@ -598,11 +728,15 @@ impl App {
                 Dialog::NewQueue { name, tracks } => self.create_queue(name.trim(), tracks),
                 Dialog::RenameQueue { tab, name } => self.rename_queue(tab, name.trim()),
                 Dialog::ConfirmDelete { name } => self.delete_saved_queue(&name),
-                Dialog::MusicFolder { path, pending_scan } => {
+                Dialog::MusicFolder {
+                    path,
+                    pending_scan,
+                    scan_mode,
+                } => {
                     let mut settings = self.settings.clone();
                     settings.music_dir = Some(PathBuf::from(path.trim()));
                     self.save_settings(settings);
-                    self.scan_replay_gain(ctx, pending_scan);
+                    self.scan_replay_gain(ctx, pending_scan, scan_mode);
                 }
             },
         }
@@ -664,11 +798,92 @@ impl App {
         });
     }
 
+    fn show_browser_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        panel_margin: f32,
+        actions: &mut Vec<Action>,
+    ) {
+        let content_width = *self
+            .browser_width
+            .get_or_insert_with(|| browser::content_width(ui, &self.library, self.browse_mode));
+        let min_width = browser::min_width(ui) + panel_margin;
+        let range = egui::Rangef::new(min_width, (content_width + panel_margin).max(min_width));
+
+        let mut panel = egui::Panel::left("browser")
+            .resizable(true)
+            .default_size(260.0)
+            .size_range(range);
+        if let Some(width) = self.requested_width(Pane::Browser, self.browser_panel_width, range) {
+            panel = panel.exact_size(width);
+        }
+
+        let rect = panel
+            .show(ui, |ui| {
+                let queue_names = self.queue_names();
+                let view = BrowserView {
+                    library: &self.library,
+                    mode: self.browse_mode,
+                    selected: &self.collection,
+                    queue_names: &queue_names,
+                    command: self.browser_command,
+                };
+                browser::show(ui, view, &mut self.browser_search, actions);
+            })
+            .response
+            .rect;
+        self.browser_panel_width = rect.width();
+        self.update_pane_focus(ui, Pane::Browser, rect);
+    }
+
+    fn show_now_playing_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        panel_margin: f32,
+        actions: &mut Vec<Action>,
+    ) {
+        let song = self.now_playing();
+        let art_width = nowplaying::content_width(song.as_ref(), &self.art);
+        let range = egui::Rangef::new(
+            MIN_PANEL_WIDTH,
+            (art_width + panel_margin).max(MIN_PANEL_WIDTH),
+        );
+
+        let mut panel = egui::Panel::right("now_playing")
+            .resizable(true)
+            .default_size(280.0)
+            .size_range(range);
+        if let Some(width) =
+            self.requested_width(Pane::NowPlaying, self.now_playing_panel_width, range)
+        {
+            panel = panel.exact_size(width);
+        }
+
+        let rect = panel
+            .show(ui, |ui| {
+                nowplaying::show(ui, song.as_ref(), &mut self.art, &mut self.mpd, actions);
+            })
+            .response
+            .rect;
+        self.now_playing_panel_width = rect.width();
+        self.update_pane_focus(ui, Pane::NowPlaying, rect);
+    }
+
+    /// A click inside a pane gives it focus, and the focused pane is outlined.
+    fn update_pane_focus(&mut self, ui: &egui::Ui, pane: Pane, rect: egui::Rect) {
+        if pressed_inside(ui, rect) {
+            self.focus = pane;
+        }
+        if self.focus == pane {
+            outline_focused_pane(ui, rect);
+        }
+    }
+
     fn show_filter(&mut self, ui: &mut egui::Ui) {
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.filter)
                 .id(egui::Id::unique(FILTER_ID))
-                .hint_text("Filter: words, artist:, album:, title:, genre:, date:, path:, -exclude  (Ctrl+F)")
+                .hint_text("Filter: words, artist:, album:, title:, genre:, date:, path:, -exclude  (/ or Ctrl+F)")
                 .desired_width(f32::INFINITY),
         );
 
@@ -709,10 +924,6 @@ impl App {
             tracks::sort_rows(&mut rows, sort);
         }
 
-        if self.select_all_tracks {
-            self.selection.select_all(&row_positions(&rows));
-        }
-
         ui.horizontal(|ui| {
             if let Some(first) = rows.first() {
                 nowplaying::album_art(ui, &first.song, 48.0, &mut self.art, &mut self.mpd);
@@ -744,6 +955,7 @@ impl App {
             queue_names: &queue_names,
             allow_reorder: false,
             sort: self.library_sort,
+            command: self.track_command,
         };
         tracks::show(
             ui,
@@ -771,10 +983,6 @@ impl App {
         }
         if let Some(sort) = sort {
             tracks::sort_rows(&mut rows, sort);
-        }
-
-        if self.select_all_tracks {
-            self.selection.select_all(&row_positions(&rows));
         }
 
         ui.horizontal(|ui| {
@@ -809,6 +1017,7 @@ impl App {
             queue_names: &queue_names,
             allow_reorder: query.is_empty() && sort.is_none(),
             sort,
+            command: self.track_command,
         };
         tracks::show(
             ui,
@@ -818,10 +1027,6 @@ impl App {
             actions,
         );
     }
-}
-
-fn row_positions(rows: &[TrackRow]) -> Vec<usize> {
-    rows.iter().map(|row| row.position).collect()
 }
 
 fn row_uris(rows: &[TrackRow]) -> Vec<String> {
@@ -855,36 +1060,10 @@ impl eframe::App for App {
             .sum()
             .x;
 
-        let browser_width = *self
-            .browser_width
-            .get_or_insert_with(|| browser::content_width(ui, &self.library, self.browse_mode));
-        let browser_min = browser::min_width(ui) + panel_margin;
-        egui::Panel::left("browser")
-            .resizable(true)
-            .default_size(260.0)
-            .size_range(browser_min..=(browser_width + panel_margin).max(browser_min))
-            .show(ui, |ui| {
-                let queue_names = self.queue_names();
-                let view = BrowserView {
-                    library: &self.library,
-                    mode: self.browse_mode,
-                    selected: &self.collection,
-                    queue_names: &queue_names,
-                };
-                browser::show(ui, view, &mut self.browser_search, &mut actions);
-            });
+        self.show_browser_panel(ui, panel_margin, &mut actions);
+        self.show_now_playing_panel(ui, panel_margin, &mut actions);
 
-        let song = self.now_playing();
-        let art_width = nowplaying::content_width(song.as_ref(), &self.art);
-        egui::Panel::right("now_playing")
-            .resizable(true)
-            .default_size(280.0)
-            .size_range(MIN_PANEL_WIDTH..=(art_width + panel_margin).max(MIN_PANEL_WIDTH))
-            .show(ui, |ui| {
-                nowplaying::show(ui, song.as_ref(), &mut self.art, &mut self.mpd);
-            });
-
-        egui::CentralPanel::default_margins().show(ui, |ui| {
+        let central = egui::CentralPanel::default_margins().show(ui, |ui| {
             tabs::show(ui, &self.queues, &self.store, self.view, &mut actions);
             ui.separator();
             if self.view != View::Settings {
@@ -899,7 +1078,10 @@ impl eframe::App for App {
                 }
             }
         });
-        self.select_all_tracks = false;
+        self.update_pane_focus(ui, Pane::Tracks, central.response.rect);
+        self.track_command = None;
+        self.browser_command = None;
+        self.pane_resize = None;
 
         self.show_dialog(&ctx);
 
@@ -915,5 +1097,18 @@ impl eframe::App for App {
         if matches!(self.connection, ConnectionState::Connected) {
             self.mpd.stop_and_wait(EXIT_STOP_TIMEOUT);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_focus_stops_at_the_window_edges() {
+        assert_eq!(Pane::Tracks.left(), Pane::Browser);
+        assert_eq!(Pane::Browser.left(), Pane::Browser);
+        assert_eq!(Pane::Tracks.right(), Pane::NowPlaying);
+        assert_eq!(Pane::NowPlaying.right(), Pane::NowPlaying);
     }
 }

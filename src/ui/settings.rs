@@ -6,7 +6,6 @@ use crate::app::Action;
 use crate::settings::Settings;
 
 /// Edits `draft`, a copy of the saved settings that only takes effect on Save.
-/// Each group of settings gets its own section function.
 pub fn show(ui: &mut egui::Ui, draft: &mut Settings, saved: &Settings, actions: &mut Vec<Action>) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)

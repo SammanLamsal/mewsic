@@ -2,6 +2,8 @@ use std::path::Path;
 
 use eframe::egui;
 
+use crate::replaygain::ScanMode;
+
 pub enum Dialog {
     NewQueue {
         name: String,
@@ -18,6 +20,7 @@ pub enum Dialog {
     MusicFolder {
         path: String,
         pending_scan: Vec<String>,
+        scan_mode: ScanMode,
     },
 }
 
@@ -84,19 +87,8 @@ fn name_prompt(
 
     let pressed_enter =
         response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-    let mut outcome = DialogOutcome::StillOpen;
-
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let ok = ui.add_enabled(is_valid, egui::Button::new("OK"));
-        if ok.clicked() || (pressed_enter && is_valid) {
-            outcome = DialogOutcome::Confirmed;
-        }
-        if ui.button("Cancel").clicked() {
-            outcome = DialogOutcome::Cancelled;
-        }
-    });
-    outcome
+    confirm_buttons(ui, "OK", is_valid, pressed_enter)
 }
 
 fn music_folder_prompt(ui: &mut egui::Ui, path: &mut String) -> DialogOutcome {
@@ -124,19 +116,8 @@ fn music_folder_prompt(ui: &mut egui::Ui, path: &mut String) -> DialogOutcome {
 
     let pressed_enter =
         response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-    let mut outcome = DialogOutcome::StillOpen;
-
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let ok = ui.add_enabled(is_valid, egui::Button::new("Scan"));
-        if ok.clicked() || (pressed_enter && is_valid) {
-            outcome = DialogOutcome::Confirmed;
-        }
-        if ui.button("Cancel").clicked() {
-            outcome = DialogOutcome::Cancelled;
-        }
-    });
-    outcome
+    confirm_buttons(ui, "Scan", is_valid, pressed_enter)
 }
 
 fn confirm_delete(ui: &mut egui::Ui, name: &str) -> DialogOutcome {
@@ -145,10 +126,19 @@ fn confirm_delete(ui: &mut egui::Ui, name: &str) -> DialogOutcome {
         "Delete the saved queue \"{name}\"? This cannot be undone."
     ));
     ui.add_space(4.0);
+    confirm_buttons(ui, "Delete", true, false)
+}
 
+fn confirm_buttons(
+    ui: &mut egui::Ui,
+    confirm_label: &str,
+    enabled: bool,
+    pressed_enter: bool,
+) -> DialogOutcome {
     let mut outcome = DialogOutcome::StillOpen;
     ui.horizontal(|ui| {
-        if ui.button("Delete").clicked() {
+        let confirm = ui.add_enabled(enabled, egui::Button::new(confirm_label));
+        if confirm.clicked() || (pressed_enter && enabled) {
             outcome = DialogOutcome::Confirmed;
         }
         if ui.button("Cancel").clicked() {

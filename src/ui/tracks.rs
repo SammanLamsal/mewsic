@@ -7,7 +7,8 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::Action;
 use crate::library::{Song, SongSort, SortColumn};
-use crate::ui::{format_duration, text_width};
+use crate::ui::motion::{self, Motion};
+use crate::ui::{format_duration, replay_gain_menu, text_width};
 
 const ROW_HEIGHT: f32 = 22.0;
 const MIN_TITLE_WIDTH: f32 = 80.0;
@@ -33,6 +34,15 @@ pub enum TrackSource {
     Queue { tab: usize },
 }
 
+/// A keyboard command for the table, applied by `show` since it knows which rows are visible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrackCommand {
+    SelectAll,
+    Move { motion: Motion, extend: bool },
+    PlayCursor,
+    SelectPlaying,
+}
+
 pub struct TrackTable<'a> {
     pub rows: &'a [TrackRow<'a>],
     pub source: TrackSource,
@@ -40,10 +50,18 @@ pub struct TrackTable<'a> {
     pub queue_names: &'a [String],
     pub allow_reorder: bool,
     pub sort: Option<SongSort>,
+    pub command: Option<TrackCommand>,
 }
 
 #[derive(Clone, Copy)]
 struct DraggedTrack(usize);
+
+/// `align: None` scrolls just far enough to show the row.
+#[derive(Debug, PartialEq)]
+struct ScrollTarget {
+    row: usize,
+    align: Option<egui::Align>,
+}
 
 /// How far the Title and Artist columns may be widened: up to their longest entry.
 /// Measured again only when the rows change.
@@ -91,16 +109,27 @@ pub fn show(
     let ctx = ui.ctx().clone();
     widths.update(ui, table.rows);
 
+    let half_page = motion::half_page(ui, ROW_HEIGHT);
+    let scroll_target = match table.command {
+        Some(command) => apply_command(command, &table, half_page, selection, actions),
+        None => None,
+    };
+
     let sense = if table.allow_reorder {
         egui::Sense::click_and_drag()
     } else {
         egui::Sense::click()
     };
 
-    TableBuilder::new(ui)
+    let mut builder = TableBuilder::new(ui)
         .striped(true)
         .sense(sense)
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+    if let Some(target) = scroll_target {
+        builder = builder.scroll_to_row(target.row, target.align);
+    }
+
+    builder
         .column(Column::exact(36.0))
         .column(
             Column::initial(300.0)
@@ -158,6 +187,48 @@ pub fn show(
 
 pub fn sort_rows(rows: &mut [TrackRow], sort: SongSort) {
     rows.sort_by(|a, b| sort.compare(&a.song, &b.song));
+}
+
+/// Returns where to scroll, if the cursor moved.
+fn apply_command(
+    command: TrackCommand,
+    table: &TrackTable,
+    half_page: usize,
+    selection: &mut Selection,
+    actions: &mut Vec<Action>,
+) -> Option<ScrollTarget> {
+    let visible_order = visible_positions(table);
+    match command {
+        TrackCommand::SelectAll => {
+            selection.select_all(&visible_order);
+            None
+        }
+        TrackCommand::Move { motion, extend } => {
+            let cursor_row = selection.cursor_row(&visible_order);
+            let target = motion::target_row(motion, cursor_row, visible_order.len(), half_page)?;
+            selection.move_cursor_to(target, extend, &visible_order);
+            Some(ScrollTarget {
+                row: target,
+                align: None,
+            })
+        }
+        TrackCommand::PlayCursor => {
+            let row = selection.cursor_row(&visible_order)?;
+            play_row(table, &table.rows[row], actions);
+            None
+        }
+        TrackCommand::SelectPlaying => {
+            let playing_position = table.playing_position?;
+            let row = visible_order
+                .iter()
+                .position(|&position| position == playing_position)?;
+            selection.select_only(playing_position);
+            Some(ScrollTarget {
+                row,
+                align: Some(egui::Align::Center),
+            })
+        }
+    }
 }
 
 fn header_title(column: SortColumn) -> &'static str {
@@ -232,13 +303,17 @@ fn handle_row_clicks(
     }
 
     if response.double_clicked() {
-        match table.source {
-            TrackSource::Library => actions.push(Action::PlayNow(vec![track.song.uri.clone()])),
-            TrackSource::Queue { tab } => actions.push(Action::PlayInTab {
-                tab,
-                position: track.position,
-            }),
-        }
+        play_row(table, track, actions);
+    }
+}
+
+fn play_row(table: &TrackTable, track: &TrackRow, actions: &mut Vec<Action>) {
+    match table.source {
+        TrackSource::Library => actions.push(Action::PlayNow(vec![track.song.uri.clone()])),
+        TrackSource::Queue { tab } => actions.push(Action::PlayInTab {
+            tab,
+            position: track.position,
+        }),
     }
 }
 
@@ -305,13 +380,7 @@ fn show_context_menu(
     });
 
     ui.separator();
-    if ui
-        .button("Scan ReplayGain")
-        .on_hover_text("Album gain is measured over the selected tracks of each album")
-        .clicked()
-    {
-        actions.push(Action::ScanReplayGain(selected_uris(table, selection)));
-    }
+    replay_gain_menu(ui, || selected_uris(table, selection), actions);
 
     if let TrackSource::Queue { tab } = table.source {
         ui.separator();
@@ -338,16 +407,19 @@ fn selected_uris(table: &TrackTable, selection: &Selection) -> Vec<String> {
     uris
 }
 
+/// `anchor` is where Shift ranges start; `cursor` is the row last clicked or moved to.
 #[derive(Default)]
 pub struct Selection {
     selected: BTreeSet<usize>,
     anchor: Option<usize>,
+    cursor: Option<usize>,
 }
 
 impl Selection {
     pub fn clear(&mut self) {
         self.selected.clear();
         self.anchor = None;
+        self.cursor = None;
     }
 
     pub fn contains(&self, position: usize) -> bool {
@@ -361,12 +433,14 @@ impl Selection {
     pub fn select_all(&mut self, positions: &[usize]) {
         self.selected = positions.iter().copied().collect();
         self.anchor = positions.first().copied();
+        self.cursor = self.anchor;
     }
 
     pub fn select_only(&mut self, position: usize) {
         self.selected.clear();
         self.selected.insert(position);
         self.anchor = Some(position);
+        self.cursor = Some(position);
     }
 
     /// `visible_order` is the order rows are shown in, which Shift-click ranges follow.
@@ -378,6 +452,7 @@ impl Selection {
                 self.selected.clear();
             }
             self.selected.extend(range);
+            self.cursor = Some(position);
             return;
         }
 
@@ -386,10 +461,29 @@ impl Selection {
                 self.selected.insert(position);
             }
             self.anchor = Some(position);
+            self.cursor = Some(position);
             return;
         }
 
         self.select_only(position);
+    }
+
+    /// The cursor's index in `visible_order`, if it is shown.
+    pub fn cursor_row(&self, visible_order: &[usize]) -> Option<usize> {
+        let cursor = self.cursor?;
+        visible_order.iter().position(|&p| p == cursor)
+    }
+
+    /// With `extend`, the selection grows from the anchor to the new row, as with Shift-click.
+    pub fn move_cursor_to(&mut self, row: usize, extend: bool, visible_order: &[usize]) {
+        let Some(&position) = visible_order.get(row) else {
+            return;
+        };
+        if extend {
+            self.click(position, egui::Modifiers::SHIFT, visible_order);
+        } else {
+            self.select_only(position);
+        }
     }
 
     fn range_from_anchor(&self, position: usize, visible_order: &[usize]) -> Option<Vec<usize>> {
@@ -454,5 +548,77 @@ mod tests {
         selection.click(30, command(), &ORDER);
         selection.click(10, command(), &ORDER);
         assert_eq!(selection.positions(), [30]);
+    }
+
+    #[test]
+    fn moving_the_cursor_selects_one_row() {
+        let mut selection = Selection::default();
+        selection.click(20, egui::Modifiers::NONE, &ORDER);
+        selection.move_cursor_to(2, false, &ORDER);
+        assert_eq!(selection.positions(), [30]);
+        assert_eq!(selection.cursor_row(&ORDER), Some(2));
+    }
+
+    fn queue_table<'a>(
+        rows: &'a [TrackRow<'a>],
+        playing_position: Option<usize>,
+    ) -> TrackTable<'a> {
+        TrackTable {
+            rows,
+            source: TrackSource::Queue { tab: 0 },
+            playing_position,
+            queue_names: &[],
+            allow_reorder: false,
+            sort: None,
+            command: None,
+        }
+    }
+
+    #[test]
+    fn selecting_the_playing_track_follows_the_shown_order() {
+        let mut rows = Vec::new();
+        for position in [30, 10, 20] {
+            rows.push(TrackRow {
+                position,
+                song: Cow::Owned(Song::default()),
+            });
+        }
+        let mut selection = Selection::default();
+        let mut actions = Vec::new();
+
+        let table = queue_table(&rows, Some(10));
+        let target = apply_command(
+            TrackCommand::SelectPlaying,
+            &table,
+            10,
+            &mut selection,
+            &mut actions,
+        );
+        let expected = ScrollTarget {
+            row: 1,
+            align: Some(egui::Align::Center),
+        };
+        assert_eq!(target, Some(expected));
+        assert_eq!(selection.positions(), [10]);
+
+        let table = queue_table(&rows, None);
+        let target = apply_command(
+            TrackCommand::SelectPlaying,
+            &table,
+            10,
+            &mut selection,
+            &mut actions,
+        );
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn extending_the_cursor_selects_from_the_anchor() {
+        let mut selection = Selection::default();
+        selection.click(20, egui::Modifiers::NONE, &ORDER);
+        selection.move_cursor_to(2, true, &ORDER);
+        selection.move_cursor_to(3, true, &ORDER);
+        assert_eq!(selection.positions(), [20, 30, 40]);
+        assert_eq!(selection.cursor_row(&ORDER), Some(3));
     }
 }

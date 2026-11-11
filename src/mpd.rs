@@ -35,9 +35,8 @@ pub fn replay_gain_label(mode: ReplayGainMode) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LoopMode {
-    #[default]
     Off,
     Queue,
     Track,
@@ -94,14 +93,6 @@ impl ConnectionConfig {
         }
     }
 
-    pub fn describe(&self) -> String {
-        if self.is_socket_path() {
-            self.host.clone()
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-
     fn is_socket_path(&self) -> bool {
         cfg!(unix) && self.host.starts_with('/')
     }
@@ -115,6 +106,8 @@ pub enum Command {
     Next,
     Previous,
     SeekTo(Duration),
+    SeekForward(Duration),
+    SeekBackward(Duration),
     SetVolume(u8),
     SetReplayGain(ReplayGainMode),
     SetRandom(bool),
@@ -327,7 +320,7 @@ async fn connect(config: &ConnectionConfig) -> anyhow::Result<(Client, Connectio
     let address = (config.host.as_str(), config.port);
     let stream = tokio::net::TcpStream::connect(address)
         .await
-        .with_context(|| format!("cannot reach MPD at {}", config.describe()))?;
+        .with_context(|| format!("cannot reach MPD at {}:{}", config.host, config.port))?;
     let connection = Client::connect_with_password_opt(stream, password).await?;
     Ok(connection)
 }
@@ -503,6 +496,16 @@ impl Worker {
             Command::SeekTo(time) => {
                 client
                     .command(mpd_commands::Seek(SeekMode::Absolute(time)))
+                    .await
+            }
+            Command::SeekForward(time) => {
+                client
+                    .command(mpd_commands::Seek(SeekMode::Forward(time)))
+                    .await
+            }
+            Command::SeekBackward(time) => {
+                client
+                    .command(mpd_commands::Seek(SeekMode::Backward(time)))
                     .await
             }
             Command::SetVolume(volume) => client.command(mpd_commands::SetVolume(volume)).await,

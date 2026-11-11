@@ -1,5 +1,6 @@
 use eframe::egui;
 
+use crate::app::Action;
 use crate::art::ArtCache;
 use crate::library::Song;
 use crate::mpd::MpdHandle;
@@ -15,7 +16,13 @@ pub fn content_width(song: Option<&Song>, art: &ArtCache) -> f32 {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, song: Option<&Song>, art: &mut ArtCache, mpd: &mut MpdHandle) {
+pub fn show(
+    ui: &mut egui::Ui,
+    song: Option<&Song>,
+    art: &mut ArtCache,
+    mpd: &mut MpdHandle,
+    actions: &mut Vec<Action>,
+) {
     let Some(song) = song else {
         ui.centered_and_justified(|ui| {
             ui.weak("Nothing playing");
@@ -39,6 +46,15 @@ pub fn show(ui: &mut egui::Ui, song: Option<&Song>, art: &mut ArtCache, mpd: &mu
     }
     if !song.date.is_empty() {
         ui.weak(&song.date);
+    }
+
+    ui.add_space(8.0);
+    if ui
+        .button("Show in queue")
+        .on_hover_text("Scroll to the playing track (o)")
+        .clicked()
+    {
+        actions.push(Action::ShowPlaying);
     }
 }
 

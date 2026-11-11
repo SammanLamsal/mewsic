@@ -1,3 +1,5 @@
+use unicode_normalization::char::{decompose_compatible, is_combining_mark};
+
 use crate::library::Song;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,35 +32,81 @@ impl Field {
 #[derive(Debug, PartialEq)]
 struct Term {
     field: Field,
-    text: String,
+    needle: Needle,
     negated: bool,
 }
 
 impl Term {
     fn matches(&self, song: &Song) -> bool {
+        let needle = &self.needle;
         let found = match self.field {
             Field::Any => {
-                contains(song.display_title(), &self.text)
-                    || contains(&song.artist, &self.text)
-                    || contains(&song.album_artist, &self.text)
-                    || contains(&song.album, &self.text)
-                    || contains(&song.uri, &self.text)
+                needle.is_in(song.display_title())
+                    || needle.is_in(&song.artist)
+                    || needle.is_in(&song.album_artist)
+                    || needle.is_in(&song.album)
+                    || needle.is_in(&song.uri)
             }
-            Field::Title => contains(song.display_title(), &self.text),
-            Field::Artist => contains(&song.artist, &self.text),
-            Field::AlbumArtist => contains(&song.album_artist, &self.text),
-            Field::Album => contains(&song.album, &self.text),
-            Field::Genre => contains(&song.genre, &self.text),
-            Field::Date => contains(&song.date, &self.text),
-            Field::Path => contains(&song.uri, &self.text),
+            Field::Title => needle.is_in(song.display_title()),
+            Field::Artist => needle.is_in(&song.artist),
+            Field::AlbumArtist => needle.is_in(&song.album_artist),
+            Field::Album => needle.is_in(&song.album),
+            Field::Genre => needle.is_in(&song.genre),
+            Field::Date => needle.is_in(&song.date),
+            Field::Path => needle.is_in(&song.uri),
         };
 
         found != self.negated
     }
 }
 
-fn contains(haystack: &str, lowercase_needle: &str) -> bool {
-    haystack.to_lowercase().contains(lowercase_needle)
+/// One word or phrase to search for, compared without regard to case, accents, or punctuation.
+#[derive(Debug, PartialEq)]
+pub struct Needle {
+    normalized: String,
+    literal: String,
+}
+
+impl Needle {
+    pub fn new(text: &str) -> Needle {
+        Needle {
+            normalized: normalize(text),
+            literal: text.to_lowercase(),
+        }
+    }
+
+    pub fn is_in(&self, haystack: &str) -> bool {
+        // A needle of only punctuation, like the band "!!!", normalizes to nothing and would match
+        // everything, so it is searched for literally instead.
+        if self.normalized.is_empty() {
+            return haystack.to_lowercase().contains(&self.literal);
+        }
+        normalize(haystack).contains(&self.normalized)
+    }
+}
+
+/// Lowercases `text` and strips accents and punctuation, so "Don’t Stop" becomes "dont stop".
+///
+/// Punctuation is dropped rather than turned into spaces so that "dont" finds "don't" and "acdc"
+/// finds "AC/DC".
+pub fn normalize(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut pending_space = false;
+
+    for character in text.chars() {
+        decompose_compatible(character, |part| {
+            if part.is_whitespace() {
+                pending_space = !normalized.is_empty();
+            } else if part.is_alphanumeric() && !is_combining_mark(part) {
+                if pending_space {
+                    normalized.push(' ');
+                    pending_space = false;
+                }
+                normalized.extend(part.to_lowercase());
+            }
+        });
+    }
+    normalized
 }
 
 /// A filter like `alpha album:"morning" -live`: every term must match.
@@ -131,7 +179,7 @@ fn parse_term(word: &str) -> Option<Term> {
 
     Some(Term {
         field,
-        text: text.to_lowercase(),
+        needle: Needle::new(text),
         negated,
     })
 }
@@ -182,6 +230,45 @@ mod tests {
     fn unknown_prefix_is_treated_as_plain_text() {
         let query = Query::parse("re:mix");
         assert!(query.matches(&song("Re:Mix Session", "x", "y")));
+    }
+
+    #[test]
+    fn apostrophes_are_optional_on_either_side() {
+        assert!(Query::parse("dont").matches(&song("Don't Stop", "x", "y")));
+        assert!(Query::parse("dont").matches(&song("Don’t Stop", "x", "y")));
+        assert!(Query::parse("don't").matches(&song("Dont Stop", "x", "y")));
+        assert!(Query::parse("don't").matches(&song("Don’t Stop", "x", "y")));
+    }
+
+    #[test]
+    fn stylized_punctuation_is_ignored() {
+        let query = Query::parse("rock n roll");
+        assert!(query.matches(&song("Rock 'n' Roll", "x", "y")));
+        assert!(query.matches(&song("Rock'n'Roll", "x", "y")));
+        assert!(Query::parse("guns n roses").matches(&song("x", "Guns N' Roses", "y")));
+        assert!(Query::parse("til").matches(&song("x", "'Til Tuesday", "y")));
+        assert!(Query::parse("acdc").matches(&song("x", "AC/DC", "y")));
+        assert!(!Query::parse("dont").matches(&song("Do Not", "x", "y")));
+    }
+
+    #[test]
+    fn accents_are_ignored() {
+        assert!(Query::parse("beyonce").matches(&song("x", "Beyoncé", "y")));
+        assert!(Query::parse("artist:\"sigur ros\"").matches(&song("x", "Sigur Rós", "y")));
+        assert!(Query::parse("Björk").matches(&song("x", "Bjork", "y")));
+    }
+
+    #[test]
+    fn punctuation_only_terms_match_literally() {
+        let query = Query::parse("!!!");
+        assert!(query.matches(&song("x", "!!!", "y")));
+        assert!(!query.matches(&song("x", "Alpha", "y")));
+    }
+
+    #[test]
+    fn normalize_collapses_whitespace_and_drops_punctuation() {
+        assert_eq!(normalize("  Rock  'n'   Roll! "), "rock n roll");
+        assert_eq!(normalize("Ｆｕｌｌ ﬁve"), "full five");
     }
 
     #[test]

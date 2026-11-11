@@ -1,8 +1,11 @@
 use eframe::egui;
+use egui::collapsing_header::CollapsingState;
 
 use crate::app::Action;
+use crate::filter::Needle;
 use crate::library::{Collection, Directory, Library};
-use crate::ui::text_width;
+use crate::ui::motion::{self, Motion};
+use crate::ui::{replay_gain_menu, text_width};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BrowseMode {
@@ -19,11 +22,41 @@ const MODES: [(BrowseMode, &str); 4] = [
     (BrowseMode::Genres, "Genres"),
 ];
 
+impl BrowseMode {
+    pub fn next(self) -> BrowseMode {
+        self.step(1)
+    }
+
+    pub fn previous(self) -> BrowseMode {
+        self.step(MODES.len() - 1)
+    }
+
+    /// The mode `steps` places further along the mode tabs, wrapping around.
+    fn step(self, steps: usize) -> BrowseMode {
+        let index = MODES
+            .iter()
+            .position(|&(mode, _)| mode == self)
+            .unwrap_or(0);
+        MODES[(index + steps) % MODES.len()].0
+    }
+}
+
+/// A keyboard command for the sidebar, applied by `show` since it knows which entries are visible.
+/// The selected collection doubles as the cursor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrowserCommand {
+    Move(Motion),
+    Collapse,
+    Expand,
+    Play,
+}
+
 pub struct BrowserView<'a> {
     pub library: &'a Library,
     pub mode: BrowseMode,
     pub selected: &'a Collection,
     pub queue_names: &'a [String],
+    pub command: Option<BrowserCommand>,
 }
 
 #[derive(Default)]
@@ -48,16 +81,155 @@ pub fn show(
     show_search(ui, view.mode, search);
     ui.separator();
 
+    let words = search_words(&search.text);
+    let scroll_target = match view.command {
+        Some(command) => apply_command(ui, command, &view, &words, actions),
+        None => None,
+    };
+
     let all_selected = *view.selected == Collection::All;
     let all = ui.selectable_label(all_selected, Collection::All.title());
     handle_collection_response(&all, Collection::All, &view, actions);
 
-    let words = search_words(&search.text);
-    if view.mode == BrowseMode::Folders && words.is_empty() {
-        show_folders(ui, &view, actions);
+    if shows_tree(view.mode, &words) {
+        show_folders(ui, &view, scroll_target.as_ref(), actions);
     } else {
-        show_list(ui, &view, &words, actions);
+        show_list(ui, &view, &words, scroll_target.as_ref(), actions);
     }
+}
+
+fn shows_tree(mode: BrowseMode, words: &[Needle]) -> bool {
+    mode == BrowseMode::Folders && words.is_empty()
+}
+
+/// Returns the entry to scroll to, if the cursor moved.
+fn apply_command(
+    ui: &egui::Ui,
+    command: BrowserCommand,
+    view: &BrowserView,
+    words: &[Needle],
+    actions: &mut Vec<Action>,
+) -> Option<Collection> {
+    let ctx = ui.ctx();
+    match command {
+        BrowserCommand::Move(motion) => {
+            let entries = visible_entries(ctx, view, words);
+            let cursor_row = entries.iter().position(|entry| entry == view.selected);
+            let half_page = motion::half_page(ui, ui.spacing().interact_size.y);
+            let target = motion::target_row(motion, cursor_row, entries.len(), half_page)?;
+            select(entries[target].clone(), actions)
+        }
+        BrowserCommand::Expand => {
+            if shows_tree(view.mode, words) {
+                expand_folder(ctx, view);
+            }
+            None
+        }
+        BrowserCommand::Collapse => {
+            if !shows_tree(view.mode, words) {
+                return None;
+            }
+            collapse_folder(ctx, view, actions)
+        }
+        BrowserCommand::Play => {
+            actions.push(Action::PlayNow(view.library.uris_in(view.selected)));
+            None
+        }
+    }
+}
+
+fn select(collection: Collection, actions: &mut Vec<Action>) -> Option<Collection> {
+    actions.push(Action::SelectCollection(collection.clone()));
+    Some(collection)
+}
+
+/// Every entry the cursor can reach, in the order shown, starting with "All".
+fn visible_entries(ctx: &egui::Context, view: &BrowserView, words: &[Needle]) -> Vec<Collection> {
+    let mut entries = vec![Collection::All];
+    if shows_tree(view.mode, words) {
+        for directory in &view.library.root().children {
+            push_visible_folders(ctx, directory, &mut entries);
+        }
+    } else {
+        for index in filtered_indices(view, words) {
+            let (collection, _) = list_entry(view.library, view.mode, index);
+            entries.push(collection);
+        }
+    }
+    entries
+}
+
+fn push_visible_folders(ctx: &egui::Context, directory: &Directory, entries: &mut Vec<Collection>) {
+    entries.push(Collection::Directory(directory.path.clone()));
+    if !is_folder_open(ctx, &directory.path) {
+        return;
+    }
+    for child in &directory.children {
+        push_visible_folders(ctx, child, entries);
+    }
+}
+
+fn expand_folder(ctx: &egui::Context, view: &BrowserView) {
+    let Collection::Directory(path) = view.selected else {
+        return;
+    };
+    let Some(directory) = find_directory(view.library.root(), path) else {
+        return;
+    };
+    if !directory.children.is_empty() {
+        set_folder_open(ctx, path, true);
+    }
+}
+
+/// Closes the selected folder, or moves to its parent if it is already closed.
+fn collapse_folder(
+    ctx: &egui::Context,
+    view: &BrowserView,
+    actions: &mut Vec<Action>,
+) -> Option<Collection> {
+    let Collection::Directory(path) = view.selected else {
+        return None;
+    };
+    if is_folder_open(ctx, path) {
+        set_folder_open(ctx, path, false);
+        return None;
+    }
+    let parent = parent_path(path)?;
+    select(Collection::Directory(parent.to_string()), actions)
+}
+
+fn parent_path(path: &str) -> Option<&str> {
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(parent)
+}
+
+fn find_directory<'a>(directory: &'a Directory, path: &str) -> Option<&'a Directory> {
+    for child in &directory.children {
+        if child.path == path {
+            return Some(child);
+        }
+        let child_prefix = format!("{}/", child.path);
+        if path.starts_with(&child_prefix) {
+            return find_directory(child, path);
+        }
+    }
+    None
+}
+
+/// Keyed by path alone, so the keyboard can open and close folders from outside the tree's `Ui`.
+fn folder_state(ctx: &egui::Context, path: &str) -> CollapsingState {
+    let id = egui::Id::unique(("browser_folder", path));
+    CollapsingState::load_with_default_open(ctx, id, false)
+}
+
+fn is_folder_open(ctx: &egui::Context, path: &str) -> bool {
+    folder_state(ctx, path).is_open()
+}
+
+fn set_folder_open(ctx: &egui::Context, path: &str, open: bool) {
+    let mut state = folder_state(ctx, path);
+    state.set_open(open);
+    state.store(ctx);
 }
 
 fn show_search(ui: &mut egui::Ui, mode: BrowseMode, search: &mut BrowserSearch) {
@@ -82,13 +254,12 @@ fn show_search(ui: &mut egui::Ui, mode: BrowseMode, search: &mut BrowserSearch) 
     }
 }
 
-fn search_words(text: &str) -> Vec<String> {
-    text.split_whitespace().map(str::to_lowercase).collect()
+fn search_words(text: &str) -> Vec<Needle> {
+    text.split_whitespace().map(Needle::new).collect()
 }
 
-fn matches_search(label: &str, words: &[String]) -> bool {
-    let label = label.to_lowercase();
-    words.iter().all(|word| label.contains(word.as_str()))
+fn matches_search(label: &str, words: &[Needle]) -> bool {
+    words.iter().all(|word| word.is_in(label))
 }
 
 /// The width the panel needs to show its widest entry without clipping.
@@ -145,12 +316,17 @@ fn directory_width(ui: &egui::Ui, directory: &Directory) -> f32 {
     widest
 }
 
-fn show_folders(ui: &mut egui::Ui, view: &BrowserView, actions: &mut Vec<Action>) {
+fn show_folders(
+    ui: &mut egui::Ui,
+    view: &BrowserView,
+    scroll_target: Option<&Collection>,
+    actions: &mut Vec<Action>,
+) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
             for directory in &view.library.root().children {
-                show_directory(ui, directory, view, actions);
+                show_directory(ui, directory, view, scroll_target, actions);
             }
         });
 }
@@ -159,49 +335,72 @@ fn show_directory(
     ui: &mut egui::Ui,
     directory: &Directory,
     view: &BrowserView,
+    scroll_target: Option<&Collection>,
     actions: &mut Vec<Action>,
 ) {
     let collection = Collection::Directory(directory.path.clone());
     let is_selected = *view.selected == collection;
+    let is_scroll_target = scroll_target == Some(&collection);
 
     if directory.children.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().indent);
             let response = ui.selectable_label(is_selected, &directory.name);
+            if is_scroll_target {
+                response.scroll_to_me(None);
+            }
             handle_collection_response(&response, collection, view, actions);
         });
         return;
     }
 
-    let id = ui.make_persistent_id(&directory.path);
-    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+    folder_state(ui.ctx(), &directory.path)
         .show_header(ui, |ui| {
             let response = ui.selectable_label(is_selected, &directory.name);
+            if is_scroll_target {
+                response.scroll_to_me(None);
+            }
             handle_collection_response(&response, collection, view, actions);
         })
         .body(|ui| {
             for child in &directory.children {
-                show_directory(ui, child, view, actions);
+                show_directory(ui, child, view, scroll_target, actions);
             }
         });
 }
 
-fn show_list(ui: &mut egui::Ui, view: &BrowserView, words: &[String], actions: &mut Vec<Action>) {
+fn filtered_indices(view: &BrowserView, words: &[Needle]) -> Vec<usize> {
     let count = list_len(view.library, view.mode);
-    let indices: Vec<usize> = if words.is_empty() {
-        (0..count).collect()
-    } else {
-        (0..count)
-            .filter(|&index| {
-                let (_, label) = list_entry(view.library, view.mode, index);
-                matches_search(&label, words)
-            })
-            .collect()
-    };
+    if words.is_empty() {
+        return (0..count).collect();
+    }
+    (0..count)
+        .filter(|&index| {
+            let (_, label) = list_entry(view.library, view.mode, index);
+            matches_search(&label, words)
+        })
+        .collect()
+}
+
+fn show_list(
+    ui: &mut egui::Ui,
+    view: &BrowserView,
+    words: &[Needle],
+    scroll_target: Option<&Collection>,
+    actions: &mut Vec<Action>,
+) {
+    let indices = filtered_indices(view, words);
 
     if indices.is_empty() && !words.is_empty() {
         ui.weak("No matches");
         return;
+    }
+
+    let mut scroll_row = None;
+    if let Some(target) = scroll_target {
+        scroll_row = indices
+            .iter()
+            .position(|&index| list_entry(view.library, view.mode, index).0 == *target);
     }
 
     let row_height = ui.spacing().interact_size.y;
@@ -210,6 +409,9 @@ fn show_list(ui: &mut egui::Ui, view: &BrowserView, words: &[String], actions: &
         row_height,
         indices.len(),
         |ui, rows| {
+            if let Some(row) = scroll_row {
+                scroll_to_list_row(ui, row, rows.start, row_height);
+            }
             for &index in &indices[rows] {
                 let (collection, label) = list_entry(view.library, view.mode, index);
                 let is_selected = *view.selected == collection;
@@ -218,6 +420,15 @@ fn show_list(ui: &mut egui::Ui, view: &BrowserView, words: &[String], actions: &
             }
         },
     );
+}
+
+/// `show_rows` only lays out the rows in view, so the target's rect is worked out from
+/// the first row laid out, which sits at the top of the closure's `ui`.
+fn scroll_to_list_row(ui: &egui::Ui, row: usize, first_row: usize, row_height: f32) {
+    let row_pitch = row_height + ui.spacing().item_spacing.y;
+    let top = ui.max_rect().top() + (row as f32 - first_row as f32) * row_pitch;
+    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=top + row_height);
+    ui.scroll_to_rect(rect, None);
 }
 
 fn list_len(library: &Library, mode: BrowseMode) -> usize {
@@ -253,15 +464,18 @@ fn handle_collection_response(
         actions.push(Action::SelectCollection(collection.clone()));
     }
     if response.double_clicked() {
-        actions.push(Action::PlayCollection(collection.clone()));
+        actions.push(Action::PlayNow(view.library.uris_in(&collection)));
     }
 
     response.context_menu(|ui| {
         if ui.button("Play now").clicked() {
-            actions.push(Action::PlayCollection(collection.clone()));
+            actions.push(Action::PlayNow(view.library.uris_in(&collection)));
         }
         if ui.button("Open as new queue…").clicked() {
-            actions.push(Action::AskNewQueueFromCollection(collection.clone()));
+            actions.push(Action::AskNewQueue {
+                name_hint: collection.queue_name().to_string(),
+                tracks: view.library.uris_in(&collection),
+            });
         }
         ui.menu_button("Add to queue", |ui| {
             if view.queue_names.is_empty() {
@@ -269,23 +483,22 @@ fn handle_collection_response(
             }
             for (tab, name) in view.queue_names.iter().enumerate() {
                 if ui.button(name).clicked() {
-                    actions.push(Action::AddCollectionToQueue {
+                    actions.push(Action::AddToQueue {
                         tab,
-                        collection: collection.clone(),
+                        uris: view.library.uris_in(&collection),
                     });
                 }
             }
         });
         ui.separator();
-        if ui.button("Scan ReplayGain").clicked() {
-            actions.push(Action::ScanCollectionReplayGain(collection.clone()));
-        }
+        replay_gain_menu(ui, || view.library.uris_in(&collection), actions);
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::Song;
 
     #[test]
     fn search_matches_every_word_ignoring_case() {
@@ -293,6 +506,63 @@ mod tests {
         assert!(matches_search("Morning — Alpha", &words));
         assert!(!matches_search("Morning — Bravo", &words));
         assert!(matches_search("anything", &search_words("  ")));
+    }
+
+    #[test]
+    fn search_ignores_punctuation_and_accents() {
+        assert!(matches_search("Don’t Stop — Alpha", &search_words("dont")));
+        assert!(matches_search("Beyoncé", &search_words("beyonce")));
+    }
+
+    fn folder(path: &str) -> Collection {
+        Collection::Directory(path.to_string())
+    }
+
+    #[test]
+    fn the_cursor_only_reaches_folders_inside_open_ones() {
+        let library = Library::new(vec![
+            Song::from_uri("Music/Jazz/a.flac"),
+            Song::from_uri("Music/Blues/b.flac"),
+        ]);
+        let view = BrowserView {
+            library: &library,
+            mode: BrowseMode::Folders,
+            selected: &Collection::All,
+            queue_names: &[],
+            command: None,
+        };
+        let ctx = egui::Context::default();
+
+        let entries = visible_entries(&ctx, &view, &[]);
+        assert_eq!(entries, [Collection::All, folder("Music")]);
+
+        set_folder_open(&ctx, "Music", true);
+        let entries = visible_entries(&ctx, &view, &[]);
+        assert_eq!(
+            entries,
+            [
+                Collection::All,
+                folder("Music"),
+                folder("Music/Blues"),
+                folder("Music/Jazz")
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_nested_folders_and_their_parents() {
+        let library = Library::new(vec![Song::from_uri("Music/Jazz/Live/a.flac")]);
+        let live = find_directory(library.root(), "Music/Jazz/Live");
+        assert_eq!(live.map(|directory| directory.name.as_str()), Some("Live"));
+        assert_eq!(parent_path("Music/Jazz/Live"), Some("Music/Jazz"));
+        assert_eq!(parent_path("Music"), None);
+    }
+
+    #[test]
+    fn browse_modes_wrap_around() {
+        assert_eq!(BrowseMode::Genres.next(), BrowseMode::Folders);
+        assert_eq!(BrowseMode::Folders.previous(), BrowseMode::Genres);
+        assert_eq!(BrowseMode::Artists.next(), BrowseMode::Albums);
     }
 
     #[test]
@@ -311,6 +581,7 @@ mod tests {
                     mode: BrowseMode::Folders,
                     selected: &Collection::All,
                     queue_names: &[],
+                    command: None,
                 };
                 show(ui, view, &mut BrowserSearch::default(), &mut Vec::new());
                 assert!(ui.min_rect().width() <= min_width + 0.5);

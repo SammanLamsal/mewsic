@@ -1,5 +1,7 @@
 pub mod browser;
 pub mod dialogs;
+pub mod keys;
+pub mod motion;
 pub mod nowplaying;
 pub mod settings;
 pub mod tabs;
@@ -9,6 +11,9 @@ pub mod transport;
 use std::time::Duration;
 
 use eframe::egui;
+
+use crate::app::Action;
+use crate::replaygain::ScanMode;
 
 pub fn format_duration(duration: Duration) -> String {
     let total_seconds = duration.as_secs();
@@ -28,6 +33,54 @@ pub fn text_width(ui: &egui::Ui, text: &str) -> f32 {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     ui.ctx()
         .fonts_mut(|fonts| text.chars().map(|c| fonts.glyph_width(&font_id, c)).sum())
+}
+
+/// Marks the pane that keyboard commands go to.
+pub fn outline_focused_pane(ui: &egui::Ui, rect: egui::Rect) {
+    let stroke = egui::Stroke::new(1.0, ui.visuals().selection.bg_fill);
+    ui.painter()
+        .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+}
+
+/// The "Scan ReplayGain" submenu shared by the track and sidebar context menus.
+/// `uris` is only called once a choice is clicked.
+pub fn replay_gain_menu(
+    ui: &mut egui::Ui,
+    uris: impl Fn() -> Vec<String>,
+    actions: &mut Vec<Action>,
+) {
+    ui.menu_button("Scan ReplayGain", |ui| {
+        let choices = [
+            (
+                ScanMode::ByAlbum,
+                "By album",
+                "Album gain is measured over the chosen tracks of each album",
+            ),
+            (
+                ScanMode::TrackByTrack,
+                "Track by track",
+                "Writes only track gain, and removes any album gain the files had",
+            ),
+        ];
+        for (mode, label, tooltip) in choices {
+            if ui.button(label).on_hover_text(tooltip).clicked() {
+                actions.push(Action::ScanReplayGain { uris: uris(), mode });
+            }
+        }
+    });
+}
+
+/// Whether a mouse button went down inside `rect` this frame.
+pub fn pressed_inside(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    ui.input(|input| {
+        if !input.pointer.any_pressed() {
+            return false;
+        }
+        match input.pointer.interact_pos() {
+            Some(position) => rect.contains(position),
+            None => false,
+        }
+    })
 }
 
 #[cfg(test)]

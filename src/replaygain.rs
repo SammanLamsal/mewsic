@@ -33,9 +33,25 @@ enum ScanEvent {
     Finished(ScanResult),
 }
 
-/// Songs of the same album share a group. Songs without an album are tagged one by one,
-/// and streams are skipped because there is no file to tag.
-pub fn group_by_album(songs: &[&Song]) -> Vec<ScanGroup> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScanMode {
+    /// Songs of the same album share an rsgain run, so they also get an album gain.
+    ByAlbum,
+    /// Every song is measured alone. rsgain then writes only a track gain
+    /// and removes any album gain the file had.
+    TrackByTrack,
+}
+
+/// Streams are skipped because there is no file to tag.
+pub fn group(songs: &[&Song], mode: ScanMode) -> Vec<ScanGroup> {
+    match mode {
+        ScanMode::ByAlbum => group_by_album(songs),
+        ScanMode::TrackByTrack => group_by_track(songs),
+    }
+}
+
+/// Songs without an album are tagged one by one.
+fn group_by_album(songs: &[&Song]) -> Vec<ScanGroup> {
     let mut albums: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
     let mut singles = Vec::new();
 
@@ -44,10 +60,7 @@ pub fn group_by_album(songs: &[&Song]) -> Vec<ScanGroup> {
             continue;
         }
         if song.album.is_empty() {
-            singles.push(ScanGroup {
-                uris: vec![song.uri.clone()],
-                is_album: false,
-            });
+            singles.push(single_track(song));
         } else {
             let key = (song.album_artist_or_artist(), song.album.as_str());
             albums.entry(key).or_default().push(song.uri.clone());
@@ -63,6 +76,23 @@ pub fn group_by_album(songs: &[&Song]) -> Vec<ScanGroup> {
     }
     groups.extend(singles);
     groups
+}
+
+fn group_by_track(songs: &[&Song]) -> Vec<ScanGroup> {
+    let mut groups = Vec::new();
+    for song in songs {
+        if !is_stream(&song.uri) {
+            groups.push(single_track(song));
+        }
+    }
+    groups
+}
+
+fn single_track(song: &Song) -> ScanGroup {
+    ScanGroup {
+        uris: vec![song.uri.clone()],
+        is_album: false,
+    }
 }
 
 fn is_stream(uri: &str) -> bool {
@@ -290,7 +320,7 @@ mod tests {
         ];
         let references: Vec<&Song> = songs.iter().collect();
 
-        let groups = group_by_album(&references);
+        let groups = group(&references, ScanMode::ByAlbum);
 
         assert_eq!(
             groups,
@@ -305,6 +335,32 @@ mod tests {
                 },
                 ScanGroup {
                     uris: vec!["loose.mp3".to_string()],
+                    is_album: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn track_by_track_gives_every_file_its_own_group() {
+        let songs = [
+            song("a/1.flac", "Alpha", "Morning"),
+            song("a/2.flac", "Alpha", "Morning"),
+            song("http://radio.example/stream", "Radio", "Live"),
+        ];
+        let references: Vec<&Song> = songs.iter().collect();
+
+        let groups = group(&references, ScanMode::TrackByTrack);
+
+        assert_eq!(
+            groups,
+            [
+                ScanGroup {
+                    uris: vec!["a/1.flac".to_string()],
+                    is_album: false,
+                },
+                ScanGroup {
+                    uris: vec!["a/2.flac".to_string()],
                     is_album: false,
                 },
             ]
